@@ -1,6 +1,7 @@
 import streamlit as st
 import time
-from backend import DEFAULT_CONFIG, RAGSystem
+from backend import DEFAULT_CONFIG, RAGSystem, RAGEvaluator
+
 
 
 def apply_blue_theme():
@@ -66,6 +67,9 @@ def init_state():
         config = DEFAULT_CONFIG.copy()
         st.session_state.system = RAGSystem(config)
 
+    if "evaluator" not in st.session_state:
+        st.session_state.evaluator = RAGEvaluator()
+
     if "messages" not in st.session_state:
         st.session_state.messages = [
             {"role": "assistant", "content": "Hi, I’m Chatty. Upload docs and ask me stuff."}
@@ -73,6 +77,9 @@ def init_state():
 
     if "last_answer" not in st.session_state:
         st.session_state.last_answer = None
+
+    if "last_evaluation" not in st.session_state:
+        st.session_state.last_evaluation = None
 
     if "ui_show_sources" not in st.session_state:
         st.session_state.ui_show_sources = True
@@ -114,6 +121,7 @@ def sidebar_settings(system: RAGSystem):
                 {"role": "assistant", "content": "Chat cleared. Database still saved."}
             ]
             st.session_state.last_answer = None
+            st.session_state.last_evaluation = None 
             st.rerun()
 
     with colB:
@@ -123,6 +131,7 @@ def sidebar_settings(system: RAGSystem):
                 {"role": "assistant", "content": "Database cleared. Upload docs again."}
             ]
             st.session_state.last_answer = None
+            st.session_state.last_evaluation = None 
             st.rerun()
 
 
@@ -198,6 +207,7 @@ def sources_panel(system: RAGSystem):
                 f"Deleted text chunks: {res['deleted_text']} | Deleted media items: {res['deleted_media']}"
             )
             st.session_state.last_answer = None
+            st.session_state.last_evaluation = None 
             st.rerun()
 
 
@@ -256,66 +266,116 @@ def chat_input_bar():
 def process_thinking(system: RAGSystem):
     if not st.session_state.messages:
         return
-
     last = st.session_state.messages[-1]
     if last["role"] != "assistant":
         return
     if last["content"] != "__THINKING__":
         return
-
+    
     # find latest user message
     question = None
     for msg in reversed(st.session_state.messages):
         if msg["role"] == "user":
             question = msg["content"]
             break
-
+    
     if not question:
         st.session_state.messages[-1]["content"] = "I didn't receive a question."
         st.rerun()
-
+    
     # show a REAL working animation/status while backend runs
     status_placeholder = st.empty()
-
     with status_placeholder:
         with st.chat_message("assistant", avatar="🔷"):
             st.markdown("**Chatty**")
             with st.status("Thinking...", expanded=False) as status:
+                # 1️⃣ Retrieve + generate answer
                 status.update(label="Searching documents...", state="running")
                 out = system.answer(question)
-                status.update(label="Generating answer...", state="running")
+                answer = out["answer"]
+                retrieved_chunks = out.get("retrieved_chunks", [])
+                
+                # 2️⃣ Evaluate the answer
+                status.update(label="Evaluating answer quality...", state="running")
+                evaluator = st.session_state.evaluator
+                
+                # Extract chunk texts for evaluation
+                chunk_texts = [c.get("text", "") for c in retrieved_chunks]
+                
+                # Run evaluation
+                evaluation = evaluator.evaluate_response(
+                    query=question,
+                    answer=answer,
+                    retrieved_chunks=chunk_texts
+                )
+                
+                # Store evaluation results
+                st.session_state.last_evaluation = evaluation
+                
+                # 3️⃣ Optionally enforce strict faithfulness
+                # Uncomment this if you want to enforce strict grounding:
+                # if evaluation['faithfulness'] < 0.5 and "don't have enough information" not in answer.lower():
+                #     answer = "I don't have enough information to answer this question."
+                #     out["answer"] = answer
+                
                 status.update(label="Done!", state="complete")
-
+    
     st.session_state.last_answer = out
-
     # Replace THINKING token with answer text
-    st.session_state.messages[-1]["content"] = out["answer"]
-
+    st.session_state.messages[-1]["content"] = answer
     # Clear the temporary status render + rerun to show final answer normally
     status_placeholder.empty()
     st.rerun()
 
 
-def clean_refusal(answer: str) -> str:
-    if not answer:
-        return answer
-
-    target = "I don't have enough information to answer this question."
-    if target in answer:
-        return target
-
-    return answer
-
-
 
 def answer_details_panel():
     st.subheader("Answer details")
-
     out = st.session_state.last_answer
+    evaluation = st.session_state.last_evaluation
+    
     if not out:
         st.write("Ask something to see sources and retrieval details.")
         return
-
+    
+    # ADD THIS: Show evaluation metrics at the top
+    if evaluation:
+        with st.expander("📊 Answer Quality Metrics", expanded=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.metric(
+                    "Faithfulness",
+                    f"{evaluation['faithfulness']:.2%}",
+                    help="How well grounded the answer is in retrieved chunks"
+                )
+                st.metric(
+                    "Relevance",
+                    f"{evaluation['relevance']:.2%}",
+                    help="How relevant the answer is to the question"
+                )
+            
+            with col2:
+                st.metric(
+                    "Composite Score",
+                    f"{evaluation['composite_score']:.2%}",
+                    help="Overall answer quality score"
+                )
+                hallucination_status = "🚨 Yes" if evaluation['hallucination'] else "✅ No"
+                st.metric(
+                    "Hallucination",
+                    hallucination_status,
+                    help="Whether unsupported claims were detected"
+                )
+            
+            # Show quality indicator
+            if evaluation['composite_score'] >= 0.7:
+                st.success("✅ High quality answer")
+            elif evaluation['composite_score'] >= 0.3:
+                st.warning("⚠️ Medium quality answer")
+            else:
+                st.error("❌ Low quality answer")
+    
     if st.session_state.ui_show_sources:
         with st.expander("Sources", expanded=True):
             sources = out.get("sources", [])
@@ -324,7 +384,7 @@ def answer_details_panel():
             else:
                 for s in sources:
                     st.write(s)
-
+    
     if st.session_state.ui_show_chunks:
         with st.expander("Retrieved chunks", expanded=False):
             chunks = out.get("retrieved_chunks", [])
@@ -334,10 +394,10 @@ def answer_details_panel():
                 for i, ch in enumerate(chunks, start=1):
                     src = ch.get("metadata", {}).get("source", "unknown")
                     dist = ch.get("distance", None)
-                    st.markdown(f"Chunk {i} | Source: {src} | Distance: {dist}")
-                    st.write(ch.get("text", ""))
+                    st.markdown(f"**Chunk {i}** | Source: `{src}` | Distance: `{dist:.4f}`")
+                    st.text_area(f"chunk_{i}", ch.get("text", ""), height=100, label_visibility="collapsed")
                     st.divider()
-
+    
     if st.session_state.ui_show_media:
         with st.expander("Related media", expanded=False):
             media = out.get("retrieved_media", [])
@@ -349,7 +409,6 @@ def answer_details_panel():
                     kind = meta.get("type", "media")
                     src = meta.get("source", "unknown")
                     dist = m.get("distance", None)
-
                     st.markdown(f"{i}. Type: {kind} | Source: {src} | Distance: {dist}")
                     st.write(m.get("document"))
 
