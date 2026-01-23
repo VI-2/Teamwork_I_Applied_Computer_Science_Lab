@@ -16,14 +16,14 @@ import cv2
 
 from sentence_transformers import SentenceTransformer
 
-from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import PromptTemplate
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 
 
-from langchain_ollama import ChatOllama
+from langchain_ollama import OllamaEmbeddings, ChatOllama #rumi
+
 
 
 DEFAULT_CONFIG = {
@@ -113,7 +113,7 @@ def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
 
 
 def embed_clip_image(pil_img: Image.Image) -> List[float]:
-    emb = clip_model.encode(pil_img)
+    emb = clip_model.encode([pil_img])[0]  # rumi fix 
     return emb.tolist()
 
 
@@ -260,7 +260,7 @@ class MediaVectorDB:
         return len(documents)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict]:
-        q_emb = clip_model.encode(query).tolist()
+        q_emb = clip_model.encode([query]).tolist()[0]  #fix rumi
 
         results = self.collection.query(query_embeddings=[q_emb], n_results=top_k)
 
@@ -450,12 +450,13 @@ class RAGSystem:
 
         prompt = prompt_template.format(context=context, question=question)
         answer = self.llm.invoke(prompt)
+        final_answer = answer.content.strip()
 
 
         sources = list({c.get("metadata", {}).get("source", "unknown") for c in retrieved_text})
 
         return {
-            "answer": answer.content.strip(),
+            "answer": final_answer, #rumi fix 
             "sources": sources,
             "retrieved_chunks": retrieved_text,
             "retrieved_media": retrieved_media,
@@ -549,3 +550,259 @@ def evaluate_rag(system: RAGSystem, eval_questions: List[Dict]) -> List[Dict]:
         )
 
     return results
+
+class RAGEvaluator:
+    """Evaluate RAG system performance."""
+    
+    def __init__(self):
+        self.metrics = []
+        self.embedder = None  
+    
+    def evaluate_faithfulness(self, answer: str, retrieved_chunks: List[Dict]) -> float:
+        """Check if answer is grounded in retrieved chunks."""
+        if retrieved_chunks and isinstance(retrieved_chunks[0], dict):
+          retrieved_chunks = [c.get("text", "") for c in retrieved_chunks]
+
+        if not answer or not retrieved_chunks:
+            return 0.0
+        
+        
+        if "i don't have enough information" in answer.lower():
+            return 1.0  
+       
+        answer_norm = normalize_text(answer)
+        answer_tokens = set(answer_norm.split())
+        
+        if not answer_tokens:
+            return 0.0
+        
+        
+        all_chunks_text = " ".join(retrieved_chunks)
+        chunks_norm = normalize_text(all_chunks_text)
+        chunks_tokens = set(chunks_norm.split())
+        
+       
+        overlap = len(answer_tokens.intersection(chunks_tokens))
+        faithfulness_score = overlap / len(answer_tokens) if answer_tokens else 0.0
+        
+    
+        answer_bigrams = set()
+        answer_words = answer_norm.split()
+        for i in range(len(answer_words) - 1):
+            answer_bigrams.add(f"{answer_words[i]} {answer_words[i+1]}")
+        
+        chunks_bigrams = set()
+        chunks_words = chunks_norm.split()
+        for i in range(len(chunks_words) - 1):
+            chunks_bigrams.add(f"{chunks_words[i]} {chunks_words[i+1]}")
+        
+        if answer_bigrams:
+            bigram_overlap = len(answer_bigrams.intersection(chunks_bigrams)) / len(answer_bigrams)
+            
+            faithfulness_score = 0.4 * faithfulness_score + 0.6 * bigram_overlap
+        
+        return min(1.0, faithfulness_score)
+    
+    def evaluate_relevance(self, query: str, answer: str) -> float:
+        """Check if answer is relevant to query."""
+        if not query or not answer:
+            return 0.0
+        
+        
+        if "i don't have enough information" in answer.lower():
+            return 0.5
+        
+       
+        query_norm = normalize_text(query)
+        answer_norm = normalize_text(answer)
+        
+        query_tokens = set(query_norm.split())
+        answer_tokens = set(answer_norm.split())
+        
+        if not query_tokens or not answer_tokens:
+            return 0.0
+        
+        
+        intersection = len(query_tokens.intersection(answer_tokens))
+        union = len(query_tokens.union(answer_tokens))
+        
+        jaccard = intersection / union if union > 0 else 0.0
+        
+        
+        question_words = {'what', 'when', 'where', 'who', 'why', 'how', 'which'}
+        query_question_words = query_tokens.intersection(question_words)
+        
+        
+        if query_question_words:
+           
+            query_content = query_tokens - question_words
+            if query_content:
+                content_overlap = len(query_content.intersection(answer_tokens)) / len(query_content)
+                relevance_score = 0.3 * jaccard + 0.7 * content_overlap
+            else:
+                relevance_score = jaccard
+        else:
+            relevance_score = jaccard
+        
+        return min(1.0, relevance_score)
+    
+    def detect_hallucination(self, answer: str, retrieved_chunks: List[str]) -> bool:
+        """Detect if answer contains unsupported claims."""
+        if not answer or not retrieved_chunks:
+            return True
+        
+        if "i don't have enough information" in answer.lower():
+            return False
+        
+        
+        answer_norm = normalize_text(answer)
+        
+      
+       
+        answer_numbers = set(re.findall(r'\d+', answer))
+        
+    
+        all_chunks_text = " ".join(retrieved_chunks)
+        chunks_numbers = set(re.findall(r'\d+', all_chunks_text))
+     
+        unsupported_numbers = answer_numbers - chunks_numbers
+        
+
+        faithfulness = self.evaluate_faithfulness(answer, retrieved_chunks)
+
+        
+        hallucination_indicators = 0
+        
+        if faithfulness < 0.3:
+            hallucination_indicators += 1
+        
+        if len(unsupported_numbers) > 2:
+            hallucination_indicators += 1
+        
+        answer_length = len(answer.split())
+        chunks_length = len(all_chunks_text.split())
+
+        if chunks_length > 0 and answer_length > chunks_length * 0.5:
+            hallucination_indicators += 1
+        
+        answer_tokens = set(answer_norm.split())
+        chunks_tokens = set(normalize_text(all_chunks_text).split())
+        
+        unique_answer_tokens = answer_tokens - chunks_tokens
+        if len(answer_tokens) > 0:
+            unique_ratio = len(unique_answer_tokens) / len(answer_tokens)
+            if unique_ratio > 0.7:  
+                hallucination_indicators += 1
+        
+      
+        return hallucination_indicators >= 2
+    
+    def evaluate_response(self, query: str, answer: str, retrieved_chunks: List[str]) -> Dict:
+        """Run all evaluation metrics."""
+      
+        if retrieved_chunks and isinstance(retrieved_chunks[0], dict):
+            chunk_texts = [c.get('text', '') for c in retrieved_chunks]
+        else:
+            chunk_texts = retrieved_chunks
+        
+        faithfulness = self.evaluate_faithfulness(answer, chunk_texts)
+        relevance = self.evaluate_relevance(query, answer)
+        hallucination = self.detect_hallucination(answer, chunk_texts)
+        
+    
+        composite_score = (faithfulness + relevance) / 2
+        if hallucination:
+            composite_score *= 0.3  
+        
+        result = {
+            'query': query,
+            'answer': answer,
+            'faithfulness': faithfulness,
+            'relevance': relevance,
+            'hallucination': hallucination,
+            'composite_score': composite_score,
+            'num_chunks': len(chunk_texts),
+            'answer_length': len(answer.split()),
+        }
+        
+      
+        self.metrics.append(result)
+        
+        return result
+    
+    def aggregate_results(self) -> Dict:
+        """Calculate aggregate metrics across all queries."""
+        if not self.metrics:
+            return {
+                'total_queries': 0,
+                'avg_faithfulness': 0.0,
+                'avg_relevance': 0.0,
+                'hallucination_rate': 0.0,
+                'avg_composite_score': 0.0,
+                'avg_answer_length': 0.0,
+            }
+        
+        total = len(self.metrics)
+        
+        avg_faithfulness = sum(m['faithfulness'] for m in self.metrics) / total
+        avg_relevance = sum(m['relevance'] for m in self.metrics) / total
+        hallucination_count = sum(1 for m in self.metrics if m['hallucination'])
+        hallucination_rate = hallucination_count / total
+        avg_composite = sum(m['composite_score'] for m in self.metrics) / total
+        avg_answer_len = sum(m['answer_length'] for m in self.metrics) / total
+
+        high_quality_responses = sum(1 for m in self.metrics if m['composite_score'] > 0.7)
+        low_quality_responses = sum(1 for m in self.metrics if m['composite_score'] < 0.3)
+        
+        return {
+            'total_queries': total,
+            'avg_faithfulness': round(avg_faithfulness, 3),
+            'avg_relevance': round(avg_relevance, 3),
+            'hallucination_rate': round(hallucination_rate, 3),
+            'hallucination_count': hallucination_count,
+            'avg_composite_score': round(avg_composite, 3),
+            'avg_answer_length': round(avg_answer_len, 1),
+            'high_quality_responses': high_quality_responses,
+            'low_quality_responses': low_quality_responses,
+            'high_quality_rate': round(high_quality_responses / total, 3),
+        }
+    
+    def reset(self):
+        """Clear all stored metrics."""
+        self.metrics = []
+    
+    def get_detailed_report(self) -> str:
+        """Generate a detailed text report of evaluation results."""
+        if not self.metrics:
+            return "No evaluation data available."
+        
+        agg = self.aggregate_results()
+        
+        report = f"""
+
+              RAG SYSTEM EVALUATION REPORT                    
+
+Total Queries Evaluated: {agg['total_queries']}
+
+CORE METRICS
+
+Average Faithfulness:     {agg['avg_faithfulness']:.3f} (0-1 scale)
+Average Relevance:        {agg['avg_relevance']:.3f} (0-1 scale)
+Average Composite Score:  {agg['avg_composite_score']:.3f} (0-1 scale)
+
+QUALITY METRICS
+
+Hallucination Rate:       {agg['hallucination_rate']:.1%}
+Hallucination Count:      {agg['hallucination_count']}/{agg['total_queries']}
+
+High Quality Responses:   {agg['high_quality_responses']} ({agg['high_quality_rate']:.1%})
+Low Quality Responses:    {agg['low_quality_responses']}
+
+
+RESPONSE CHARACTERISTICS
+
+Avg Answer Length:        {agg['avg_answer_length']:.1f} words
+
+"""
+        return report
+
