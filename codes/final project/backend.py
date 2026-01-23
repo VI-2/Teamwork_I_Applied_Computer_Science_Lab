@@ -182,7 +182,6 @@ class TextVectorDB:
         return len(texts)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict]:
-       
         query_emb = self.embedder.embed_query(query)
 
         results = self.collection.query(
