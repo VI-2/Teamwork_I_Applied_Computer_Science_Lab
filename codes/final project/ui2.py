@@ -1,6 +1,6 @@
 import streamlit as st
 import time
-from backend import DEFAULT_CONFIG, RAGSystem, RAGEvaluator
+from backend import DEFAULT_CONFIG, RAGSystem, RAG_Evaluator
 
 
 
@@ -68,11 +68,11 @@ def init_state():
         st.session_state.system = RAGSystem(config)
 
     if "evaluator" not in st.session_state:
-        st.session_state.evaluator = RAGEvaluator()
+        st.session_state.evaluator = RAG_Evaluator()
 
     if "messages" not in st.session_state:
         st.session_state.messages = [
-            {"role": "assistant", "content": "Hi, I’m Chatty. Upload docs and ask me stuff."}
+            {"role": "assistant", "content": "Hi, I'm Chatty. Upload docs and ask me stuff."}
         ]
 
     if "last_answer" not in st.session_state:
@@ -126,7 +126,8 @@ def sidebar_settings(system: RAGSystem):
 
     with colB:
         if st.button("Clear DB"):
-            system.clear_all()
+            res = system.clear_all()
+            st.sidebar.success(f"Cleared DB: text={res['deleted_text']} | media={res['deleted_media']}")
             st.session_state.messages = [
                 {"role": "assistant", "content": "Database cleared. Upload docs again."}
             ]
@@ -136,7 +137,7 @@ def sidebar_settings(system: RAGSystem):
 
 
 def render_header(system: RAGSystem):
-    st.markdown('<div class="title">Local RAG with Ollama</div>', unsafe_allow_html=True)
+    st.markdown('<div class="title">Local RAG with Chatty (Ollama)</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="subtitle">Chat with your documents. Answer details on the right.</div>',
         unsafe_allow_html=True,
@@ -263,7 +264,7 @@ def chat_input_bar():
 
 
 
-def process_thinking(system: RAGSystem):
+def process_thinking(system: RAGSystem, RAG):
     if not st.session_state.messages:
         return
     last = st.session_state.messages[-1]
@@ -271,59 +272,90 @@ def process_thinking(system: RAGSystem):
         return
     if last["content"] != "__THINKING__":
         return
-    
+
     # find latest user message
     question = None
     for msg in reversed(st.session_state.messages):
         if msg["role"] == "user":
             question = msg["content"]
             break
-    
+
     if not question:
         st.session_state.messages[-1]["content"] = "I didn't receive a question."
         st.rerun()
-    
-    # show a REAL working animation/status while backend runs
+
+    # init success/failure history
+    if "success_cases" not in st.session_state:
+        st.session_state.success_cases = []
+
     status_placeholder = st.empty()
     with status_placeholder:
         with st.chat_message("assistant", avatar="🔷"):
             st.markdown("**Chatty**")
             with st.status("Thinking...", expanded=False) as status:
-                # 1️⃣ Retrieve + generate answer
+
+                t0 = time.perf_counter()
+
+                retrieved_chunks = []
+                retrieval_time = 0.0
+
                 status.update(label="Searching documents...", state="running")
-                out = system.answer(question)
+
+                if RAG:
+                    t_retrieval_start = time.perf_counter()
+                    out = system.answer(question)
+                    t_retrieval_end = time.perf_counter()
+
+                    retrieval_time = t_retrieval_end - t_retrieval_start
+                    retrieved_chunks = out.get("retrieved_chunks", [])
+                else:
+                    out = system.noRAGAnswer(question)
+
                 answer = out["answer"]
-                retrieved_chunks = out.get("retrieved_chunks", [])
-                
-                # 2️⃣ Evaluate the answer
+
                 status.update(label="Evaluating answer quality...", state="running")
                 evaluator = st.session_state.evaluator
-                
-                # Extract chunk texts for evaluation
+
                 chunk_texts = [c.get("text", "") for c in retrieved_chunks]
-                
-                # Run evaluation
+
                 evaluation = evaluator.evaluate_response(
                     query=question,
                     answer=answer,
                     retrieved_chunks=chunk_texts
                 )
-                
-                # Store evaluation results
+
+                t1 = time.perf_counter()
+                total_time = t1 - t0
+                generation_time = max(0.0, total_time - retrieval_time)
+
+                # attach time metrics
+                evaluation["latency"] = {
+                    "retrieval_sec": round(retrieval_time, 4),
+                    "generation_sec": round(generation_time, 4),
+                    "total_sec": round(total_time, 4),
+                }
+
+                # success / failure classification
+                success = (evaluation["composite_score"] >= 0.7) and (not evaluation["hallucination"])
+                evaluation["success"] = success
+
+                # store case history (last 20)
+                st.session_state.success_cases.append({
+                    "question": question,
+                    "score": round(evaluation["composite_score"], 3),
+                    "hallucination": evaluation["hallucination"],
+                    "success": success,
+                    "rag_enabled": bool(RAG),
+                    "latency": evaluation["latency"],
+                })
+                st.session_state.success_cases = st.session_state.success_cases[-20:]
+
                 st.session_state.last_evaluation = evaluation
-                
-                # 3️⃣ Optionally enforce strict faithfulness
-                # Uncomment this if you want to enforce strict grounding:
-                # if evaluation['faithfulness'] < 0.5 and "don't have enough information" not in answer.lower():
-                #     answer = "I don't have enough information to answer this question."
-                #     out["answer"] = answer
-                
+
                 status.update(label="Done!", state="complete")
-    
+
     st.session_state.last_answer = out
-    # Replace THINKING token with answer text
     st.session_state.messages[-1]["content"] = answer
-    # Clear the temporary status render + rerun to show final answer normally
     status_placeholder.empty()
     st.rerun()
 
@@ -338,52 +370,63 @@ def answer_details_panel():
         st.write("Ask something to see sources and retrieval details.")
         return
     
-    # ADD THIS: Show evaluation metrics at the top
-    if evaluation:
-        with st.expander("📊 Answer Quality Metrics", expanded=True):
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.metric(
-                    "Faithfulness",
-                    f"{evaluation['faithfulness']:.2%}",
-                    help="How well grounded the answer is in retrieved chunks"
-                )
-                st.metric(
-                    "Relevance",
-                    f"{evaluation['relevance']:.2%}",
-                    help="How relevant the answer is to the question"
-                )
-            
-            with col2:
-                st.metric(
-                    "Composite Score",
-                    f"{evaluation['composite_score']:.2%}",
-                    help="Overall answer quality score"
-                )
-                hallucination_status = "🚨 Yes" if evaluation['hallucination'] else "✅ No"
-                st.metric(
-                    "Hallucination",
-                    hallucination_status,
-                    help="Whether unsupported claims were detected"
-                )
-            
-            # Show quality indicator
-            if evaluation['composite_score'] >= 0.7:
-                st.success("✅ High quality answer")
-            elif evaluation['composite_score'] >= 0.3:
-                st.warning("⚠️ Medium quality answer")
-            else:
-                st.error("❌ Low quality answer")
     
-    if st.session_state.ui_show_sources:
-        with st.expander("Sources", expanded=True):
-            sources = out.get("sources", [])
-            if not sources:
-                st.write("No sources")
+    if evaluation:
+        with st.expander("Answer Quality Metrics", expanded=True):
+
+            st.metric(
+                "Faithfulness",
+                f"{evaluation['faithfulness']:.2%}",
+                help="How well grounded the answer is in retrieved chunks"
+            )
+
+            st.metric(
+                "Relevance",
+                f"{evaluation['relevance']:.2%}",
+                help="How relevant the answer is to the question"
+            )
+
+            st.metric(
+                "Composite Score",
+                f"{evaluation['composite_score']:.2%}",
+                help="Overall answer quality score"
+            )
+
+            hallucination_status = "Yes" if evaluation["hallucination"] else "No"
+            st.metric(
+                "Hallucination",
+                hallucination_status,
+                help="Whether unsupported claims were detected"
+            )
+
+            # ---- Latency ----
+            st.divider()
+            latency = evaluation.get("latency", {})
+
+            st.metric("Retrieval time (sec)", latency.get("retrieval_sec", 0.0))
+            st.metric("Generation time (sec)", latency.get("generation_sec", 0.0))
+            st.metric("Total time (sec)", latency.get("total_sec", 0.0))
+
+            # ---- Success / Failure ----
+            st.divider()
+            success = evaluation.get("success", False)
+            st.metric("Outcome", "Success" if success else "Failure")
+
+            # Quality indicator (keep yours)
+            if evaluation["composite_score"] >= 0.7:
+                st.success("High quality answer")
+            elif evaluation["composite_score"] >= 0.3:
+                st.warning("Medium quality answer")
             else:
-                for s in sources:
-                    st.write(s)
+                st.error("Low quality answer")
+        if st.session_state.ui_show_sources:
+            with st.expander("Sources", expanded=True):
+                sources = out.get("sources", [])
+                if not sources:
+                    st.write("No sources")
+                else:
+                    for s in sources:
+                        st.write(s)
     
     if st.session_state.ui_show_chunks:
         with st.expander("Retrieved chunks", expanded=False):
@@ -412,6 +455,9 @@ def answer_details_panel():
                     st.markdown(f"{i}. Type: {kind} | Source: {src} | Distance: {dist}")
                     st.write(m.get("document"))
 
+def ragOnOff():
+    ragButton = st.toggle("RAG")
+    return ragButton
 
 def main():
     st.set_page_config(page_title="Local RAG", layout="wide")
@@ -421,6 +467,7 @@ def main():
     system = st.session_state.system
 
     sidebar_settings(system)
+    rag = ragOnOff()
     render_header(system)
 
     left, middle, right = st.columns([0.32, 0.46, 0.22], gap="large")
@@ -433,11 +480,10 @@ def main():
     with middle:
         chat_feed()
 
-        # Dedicated input bar (separate container so it never messes chat layout)
         with st.container(border=True):
             chat_input_bar()
 
-        process_thinking(system)
+        process_thinking(system,rag)
 
     with right:
         with st.container(border=True):

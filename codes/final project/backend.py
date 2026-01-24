@@ -4,6 +4,9 @@ import uuid
 import shutil
 from typing import List, Dict
 from collections import Counter
+import easyocr
+import numpy as np
+
 
 import requests
 from bs4 import BeautifulSoup
@@ -15,6 +18,11 @@ from PIL import Image
 import cv2
 
 from sentence_transformers import SentenceTransformer
+
+import base64
+from io import BytesIO
+
+
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import PromptTemplate
@@ -31,6 +39,7 @@ DEFAULT_CONFIG = {
     "persist_directory": "./chroma_db",
     "embedding_model": "nomic-embed-text",
     "llm_model": "llama3",
+    "vision_llm_model": "llava",
     "top_k_retrieval": 5,
     "chunk_size": 500,
     "chunk_overlap": 50,
@@ -41,8 +50,9 @@ DEFAULT_CONFIG = {
         ".png", ".jpg", ".jpeg",
         ".mp4", ".mov", ".mkv",
     ],
-    "video_frame_step": 30,
-    "video_max_frames": 120,
+    "video_frames_folder": "./data/video_frames",
+    "video_frame_step": 60,
+    "video_max_frames": 30,
 }
 
 
@@ -66,7 +76,9 @@ Answer:
 
 prompt_template = PromptTemplate.from_template(RAG_PROMPT_TEMPLATE)
 
-clip_model = SentenceTransformer("clip-ViT-B-32")
+clip_model = SentenceTransformer("sentence-transformers/clip-ViT-B-32")
+
+ocr_reader = easyocr.Reader(["en", "de"], gpu=False)
 
 
 def ensure_folder(path: str) -> None:
@@ -75,6 +87,33 @@ def ensure_folder(path: str) -> None:
 
 def safe_filename(name: str) -> str:
     return name.replace("/", "_").replace("\\", "_")
+
+def caption_frame_with_ollama(llm: ChatOllama, pil_img: Image.Image) -> str:
+    """
+    Uses a vision-capable Ollama model (ex: llava) to caption a frame.
+    Returns a short caption string.
+    """
+    buf = BytesIO()
+    pil_img.save(buf, format="JPEG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    prompt = """Describe this video frame in 1-2 sentences.
+Be specific about visible objects, text, and actions.
+If there is readable text, include it exactly."""
+    
+    # ChatOllama supports images as base64 list in many setups
+    resp = llm.invoke(
+        [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": [img_b64],
+            }
+        ]
+    )
+
+    return resp.content.strip()
+
 
 
 def extract_text_from_url(url: str) -> str:
@@ -112,9 +151,30 @@ def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     return splitter.split_text(text)
 
 
+
+
 def embed_clip_image(pil_img: Image.Image) -> List[float]:
-    emb = clip_model.encode([pil_img])[0]  # rumi fix 
+    emb = clip_model.encode(
+        pil_img,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
     return emb.tolist()
+
+
+def extract_text_easyocr(image_path: str) -> str:
+    img = cv2.imread(image_path)
+
+    if img is None:
+        return ""
+
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    results = ocr_reader.readtext(img_rgb, detail=0)
+    text = "\n".join(results).strip()
+
+    return text
 
 
 def extract_video_frames(video_path: str, frame_step: int = 30, max_frames: int = 120) -> List[Dict]:
@@ -156,7 +216,7 @@ class TextVectorDB:
         self.embedding_model = embedding_model
         self.collection_name = collection_name
 
-        self.client = chromadb.Client(Settings(persist_directory=persist_directory))
+        self.client = chromadb.PersistentClient(path=persist_directory)
 
         # IMPORTANT: do NOT pass embedding_function here
         self.collection = self.client.get_or_create_collection(name=collection_name)
@@ -222,7 +282,8 @@ class TextVectorDB:
         return sorted(list(set(sources)))
 
     def delete_source(self, source: str) -> int:
-        data = self.collection.get(include=["metadatas", "ids"])
+        data = self.collection.get(include=["metadatas"])  
+
         ids = data.get("ids", [])
         metas = data.get("metadatas", [])
 
@@ -236,6 +297,10 @@ class TextVectorDB:
 
         self.collection.delete(ids=to_delete)
         return len(to_delete)
+    
+
+
+
 
 
 class MediaVectorDB:
@@ -243,7 +308,7 @@ class MediaVectorDB:
         self.persist_directory = persist_directory
         self.collection_name = collection_name
 
-        self.client = chromadb.Client(Settings(persist_directory=persist_directory))
+        self.client = chromadb.PersistentClient(path=persist_directory)
         self.collection = self.client.get_or_create_collection(name=collection_name)
 
     def add_media_embeddings(
@@ -260,7 +325,11 @@ class MediaVectorDB:
         return len(documents)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict]:
-        q_emb = clip_model.encode([query]).tolist()[0]  #fix rumi
+        q_emb = clip_model.encode(
+            query,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        ).tolist()
 
         results = self.collection.query(query_embeddings=[q_emb], n_results=top_k)
 
@@ -273,6 +342,7 @@ class MediaVectorDB:
             {"id": ids[i], "document": docs[i], "metadata": metas[i], "distance": dists[i]}
             for i in range(len(docs))
         ]
+
 
     def count(self) -> int:
         return int(self.collection.count())
@@ -292,7 +362,8 @@ class MediaVectorDB:
         return sorted(list(set(sources)))
 
     def delete_source(self, source: str) -> int:
-        data = self.collection.get(include=["metadatas", "ids"])
+        data = self.collection.get(include=["metadatas"])  
+
         ids = data.get("ids", [])
         metas = data.get("metadatas", [])
 
@@ -306,6 +377,11 @@ class MediaVectorDB:
 
         self.collection.delete(ids=to_delete)
         return len(to_delete)
+    
+
+
+
+
 
 
 class RAGSystem:
@@ -324,6 +400,8 @@ class RAGSystem:
         )
 
         self.llm = ChatOllama(model=config["llm_model"], temperature=0)
+        self.vision_llm = ChatOllama(model=config.get("vision_llm_model", "llava"), temperature=0)
+
 
     def ingest_text_source(self, source: str) -> int:
         raw = ""
@@ -340,16 +418,35 @@ class RAGSystem:
         return self.text_db.add_texts(chunks, metas)
 
     def ingest_image(self, image_path: str) -> int:
+    
         img = Image.open(image_path).convert("RGB")
         emb = embed_clip_image(img)
 
-        return self.media_db.add_media_embeddings(
+        self.media_db.add_media_embeddings(
             documents=[image_path],
             embeddings=[emb],
             metadatas=[{"source": image_path, "type": "image"}],
         )
 
+        
+        ocr_text = extract_text_easyocr(image_path)
+
+        if ocr_text and len(ocr_text.strip()) > 10:
+            chunks = chunk_text(
+                ocr_text,
+                self.config["chunk_size"],
+                self.config["chunk_overlap"]
+            )
+            metas = [{"source": image_path, "type": "image_ocr"} for _ in chunks]
+            return self.text_db.add_texts(chunks, metas)
+
+        return 1
+
+
     def ingest_video(self, video_path: str) -> int:
+        ensure_folder(self.config["video_frames_folder"])
+        frames_folder = self.config["video_frames_folder"]
+
         frames = extract_video_frames(
             video_path,
             frame_step=self.config["video_frame_step"],
@@ -363,21 +460,66 @@ class RAGSystem:
         embeddings = []
         metadatas = []
 
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+
+        total_text_added = 0
+
         for f in frames:
             frame_index = f["frame_index"]
             img = f["image"]
 
-            documents.append(f"{video_path} | frame={frame_index}")
+            # Save frame
+            frame_file = os.path.join(frames_folder, f"{video_name}_frame_{frame_index}.jpg")
+            img.save(frame_file)
+
+            # Store media embedding (for retrieval)
+            documents.append(frame_file)
             embeddings.append(embed_clip_image(img))
             metadatas.append(
                 {
                     "source": video_path,
                     "type": "video_frame",
                     "frame_index": frame_index,
+                    "frame_file": frame_file,
                 }
             )
 
-        return self.media_db.add_media_embeddings(documents, embeddings, metadatas)
+            # ✅ Caption using LLaVA via Ollama
+            caption = caption_frame_with_ollama(self.vision_llm, img)
+
+            if caption and len(caption.strip()) > 5:
+                caption_text = f"""
+    Video: {os.path.basename(video_path)}
+    Frame: {frame_index}
+
+    Caption:
+    {caption}
+    """.strip()
+
+                chunks = chunk_text(
+                    caption_text,
+                    self.config["chunk_size"],
+                    self.config["chunk_overlap"],
+                )
+
+                metas = [
+                    {
+                        "source": video_path,
+                        "type": "video_frame_caption",
+                        "frame_index": frame_index,
+                        "frame_file": frame_file,
+                    }
+                    for _ in chunks
+                ]
+
+                total_text_added += self.text_db.add_texts(chunks, metas)
+
+        # store media embeddings after loop
+        media_added = self.media_db.add_media_embeddings(documents, embeddings, metadatas)
+
+        return media_added + total_text_added
+
+
 
     def ingest_file(self, path: str) -> Dict:
         ext = os.path.splitext(path)[-1].lower()
@@ -438,15 +580,18 @@ class RAGSystem:
         retrieved_text = self.retrieve_text(question)
         retrieved_media = self.retrieve_media(question)
 
-        if not retrieved_text:
+        if not retrieved_text and not retrieved_media:
             return {
                 "answer": "I don't have enough information to answer this question.",
                 "sources": [],
                 "retrieved_chunks": [],
                 "retrieved_media": retrieved_media,
             }
-
+        # elif retrieved_media:
+        #     context = retrieved_media        
+        
         context = self.format_text_context(retrieved_text)
+
 
         prompt = prompt_template.format(context=context, question=question)
         answer = self.llm.invoke(prompt)
@@ -461,6 +606,14 @@ class RAGSystem:
             "retrieved_chunks": retrieved_text,
             "retrieved_media": retrieved_media,
         }
+    
+    def noRAGAnswer(self, question: str) -> Dict:
+
+        answer = self.llm.invoke(question)
+
+        return {
+            "answer": answer.content.strip()
+        }
 
     def list_all_sources(self) -> Dict:
         return {
@@ -474,6 +627,17 @@ class RAGSystem:
         return {"deleted_text": deleted_text, "deleted_media": deleted_media}
 
     def clear_all(self) -> None:
+
+        if self.text_db:
+            self.text_db.client.delete_collection(
+            name=self.config["text_collection"]
+        )
+
+        if self.media_db:
+            self.media_db.client.delete_collection(
+            name=self.config["media_collection"]
+        )
+
         if os.path.exists(self.config["persist_directory"]):
             shutil.rmtree(self.config["persist_directory"])
 
@@ -486,6 +650,7 @@ class RAGSystem:
             persist_directory=self.config["persist_directory"],
             collection_name=self.config["media_collection"],
         )
+
 
     def save_uploaded_file_to_data(self, uploaded_file) -> str:
         ensure_folder(self.config["data_folder"])
@@ -551,7 +716,7 @@ def evaluate_rag(system: RAGSystem, eval_questions: List[Dict]) -> List[Dict]:
 
     return results
 
-class RAGEvaluator:
+class RAG_Evaluator:
     """Evaluate RAG system performance."""
     
     def __init__(self):
@@ -561,7 +726,7 @@ class RAGEvaluator:
     def evaluate_faithfulness(self, answer: str, retrieved_chunks: List[Dict]) -> float:
         """Check if answer is grounded in retrieved chunks."""
         if retrieved_chunks and isinstance(retrieved_chunks[0], dict):
-          retrieved_chunks = [c.get("text", "") for c in retrieved_chunks]
+            retrieved_chunks = [c.get("text", "") for c in retrieved_chunks]
 
         if not answer or not retrieved_chunks:
             return 0.0
@@ -569,7 +734,6 @@ class RAGEvaluator:
         
         if "i don't have enough information" in answer.lower():
             return 1.0  
-       
         answer_norm = normalize_text(answer)
         answer_tokens = set(answer_norm.split())
         
@@ -581,11 +745,10 @@ class RAGEvaluator:
         chunks_norm = normalize_text(all_chunks_text)
         chunks_tokens = set(chunks_norm.split())
         
-       
+    
         overlap = len(answer_tokens.intersection(chunks_tokens))
         faithfulness_score = overlap / len(answer_tokens) if answer_tokens else 0.0
         
-    
         answer_bigrams = set()
         answer_words = answer_norm.split()
         for i in range(len(answer_words) - 1):
@@ -612,7 +775,6 @@ class RAGEvaluator:
         if "i don't have enough information" in answer.lower():
             return 0.5
         
-       
         query_norm = normalize_text(query)
         answer_norm = normalize_text(answer)
         
@@ -634,7 +796,7 @@ class RAGEvaluator:
         
         
         if query_question_words:
-           
+        
             query_content = query_tokens - question_words
             if query_content:
                 content_overlap = len(query_content.intersection(answer_tokens)) / len(query_content)
@@ -654,22 +816,16 @@ class RAGEvaluator:
         if "i don't have enough information" in answer.lower():
             return False
         
-        
         answer_norm = normalize_text(answer)
         
-      
-       
         answer_numbers = set(re.findall(r'\d+', answer))
         
-    
         all_chunks_text = " ".join(retrieved_chunks)
         chunks_numbers = set(re.findall(r'\d+', all_chunks_text))
-     
+    
         unsupported_numbers = answer_numbers - chunks_numbers
         
-
         faithfulness = self.evaluate_faithfulness(answer, retrieved_chunks)
-
         
         hallucination_indicators = 0
         
@@ -694,12 +850,12 @@ class RAGEvaluator:
             if unique_ratio > 0.7:  
                 hallucination_indicators += 1
         
-      
+    
         return hallucination_indicators >= 2
     
     def evaluate_response(self, query: str, answer: str, retrieved_chunks: List[str]) -> Dict:
         """Run all evaluation metrics."""
-      
+    
         if retrieved_chunks and isinstance(retrieved_chunks[0], dict):
             chunk_texts = [c.get('text', '') for c in retrieved_chunks]
         else:
@@ -725,7 +881,7 @@ class RAGEvaluator:
             'answer_length': len(answer.split()),
         }
         
-      
+    
         self.metrics.append(result)
         
         return result
@@ -780,7 +936,7 @@ class RAGEvaluator:
         
         report = f"""
 
-              RAG SYSTEM EVALUATION REPORT                    
+            RAG SYSTEM EVALUATION REPORT                    
 
 Total Queries Evaluated: {agg['total_queries']}
 
